@@ -1,0 +1,161 @@
+# =============================================================================
+# isa/isa.yaml -- single source of truth for the core's instruction set
+#
+# Read by:  tools/asm.py        (assembler)
+#           tools/sim.py        (instruction-level simulator / golden model)
+#           tools/gen_verilog.py (writes src/isa_defs.vh localparams)
+#           test/               (random instruction generation)
+#
+# The `desc` strings are documentation for humans. They are NOT executed:
+# the simulator and the Verilog each implement the behaviour by hand, and
+# the tests check that the two agree.
+# =============================================================================
+
+version: "0.1"
+word_bits: 16
+
+# -----------------------------------------------------------------------------
+# Programmer's model
+# -----------------------------------------------------------------------------
+registers:
+  count: 8
+  width: 16
+  names: [r0, r1, r2, r3, r4, r5, r6, r7]
+  zero: r0          # reads as 0, writes are discarded
+  link: r7          # JAL writes the return address here by convention
+
+pc_bits: 8          # 256-word program memory
+time_bits: 32       # free-running cycle counter, +1 every clock
+flags: [Z, C]       # written only by ALU ops and ADDI
+
+# -----------------------------------------------------------------------------
+# Instruction formats
+#   - fields listed MSB to LSB; must be contiguous and cover exactly 16 bits
+#   - any field an instruction does not use MUST be encoded as zero
+#   - signed fields are sign-extended to 16 bits when used
+# -----------------------------------------------------------------------------
+formats:
+  R:
+    fields:
+      - {name: op,   hi: 15, lo: 12}
+      - {name: rd,   hi: 11, lo: 9}
+      - {name: rs,   hi: 8,  lo: 6}
+      - {name: rt,   hi: 5,  lo: 3}
+      - {name: fn,   hi: 2,  lo: 0}
+  I:
+    fields:
+      - {name: op,   hi: 15, lo: 12}
+      - {name: rd,   hi: 11, lo: 9}
+      - {name: rs,   hi: 8,  lo: 6}
+      - {name: imm6, hi: 5,  lo: 0, signed: true}
+  L:
+    fields:
+      - {name: op,   hi: 15, lo: 12}
+      - {name: rd,   hi: 11, lo: 9}
+      - {name: imm9, hi: 8,  lo: 0, signed: true}
+  B:
+    fields:
+      - {name: op,   hi: 15, lo: 12}
+      - {name: cond, hi: 11, lo: 9}
+      - {name: off9, hi: 8,  lo: 0, signed: true}
+  E:
+    fields:
+      - {name: op,   hi: 15, lo: 12}
+      - {name: rd,   hi: 11, lo: 9}
+      - {name: rs,   hi: 8,  lo: 6}
+      - {name: sel,  hi: 5,  lo: 0}
+  N:                # no operands (HALT)
+    fields:
+      - {name: op,   hi: 15, lo: 12}
+      - {name: pad,  hi: 11, lo: 0}
+
+# -----------------------------------------------------------------------------
+# Branch conditions (B format `cond` field)
+# The engine status bits are wired straight into the branch unit, so polling
+# the engine costs one instruction.
+# -----------------------------------------------------------------------------
+conditions:
+  AL:   0   # always
+  Z:    1   # zero flag set
+  NZ:   2   # zero flag clear
+  C:    3   # carry set
+  NC:   4   # carry clear
+  TXR:  5   # engine TX FIFO has room
+  RXV:  6   # engine RX FIFO has a byte
+  DONE: 7   # engine frame done
+
+# -----------------------------------------------------------------------------
+# Instructions
+#   op:       value of the op field
+#   fixed:    other fields the assembler fills in automatically
+#   operands: fields the programmer writes, in assembly-syntax order
+#   flags:    flags this instruction writes
+#   cycles:   1, or "var" for instructions that stall
+# -----------------------------------------------------------------------------
+instructions:
+
+  # --- ALU, register-register (op 0, fn selects the operation) ---------------
+  ADD:   {format: R, op: 0x0, fixed: {fn: 0}, operands: [rd, rs, rt], flags: [Z, C], cycles: 1, desc: "rd = rs + rt"}
+  SUB:   {format: R, op: 0x0, fixed: {fn: 1}, operands: [rd, rs, rt], flags: [Z, C], cycles: 1, desc: "rd = rs - rt"}
+  AND:   {format: R, op: 0x0, fixed: {fn: 2}, operands: [rd, rs, rt], flags: [Z, C], cycles: 1, desc: "rd = rs & rt"}
+  OR:    {format: R, op: 0x0, fixed: {fn: 3}, operands: [rd, rs, rt], flags: [Z, C], cycles: 1, desc: "rd = rs | rt"}
+  XOR:   {format: R, op: 0x0, fixed: {fn: 4}, operands: [rd, rs, rt], flags: [Z, C], cycles: 1, desc: "rd = rs ^ rt"}
+  SLL:   {format: R, op: 0x0, fixed: {fn: 5}, operands: [rd, rs, rt], flags: [Z, C], cycles: 1, desc: "rd = rs << rt[3:0]"}
+  SRL:   {format: R, op: 0x0, fixed: {fn: 6}, operands: [rd, rs, rt], flags: [Z, C], cycles: 1, desc: "rd = rs >> rt[3:0] (logical)"}
+  SRA:   {format: R, op: 0x0, fixed: {fn: 7}, operands: [rd, rs, rt], flags: [Z, C], cycles: 1, desc: "rd = rs >>> rt[3:0] (arithmetic)"}
+
+  # --- Immediates -------------------------------------------------------------
+  ADDI:  {format: I, op: 0x1, operands: [rd, rs, imm6], flags: [Z, C], cycles: 1, desc: "rd = rs + sext(imm6)"}
+  LI:    {format: L, op: 0x2, operands: [rd, imm9], cycles: 1, desc: "rd = sext(imm9)"}
+  LIH:   {format: L, op: 0x3, operands: [rd, imm9], cycles: 1, desc: "rd = (rd & 0x00FF) | (imm9[7:0] << 8)"}
+  # TODO: LIH only uses 8 of its 9 immediate bits -- require imm9[8] == 0?
+
+  # --- Control flow -----------------------------------------------------------
+  B:     {format: B, op: 0x4, operands: [cond, off9], cycles: 1, desc: "if cond: PC = PC + sext(off9)"}
+  JAL:   {format: L, op: 0x5, operands: [rd, imm9], cycles: 1, desc: "rd = PC + 1; PC = PC + sext(imm9)"}
+  JR:    {format: E, op: 0x6, operands: [rs], cycles: 1, desc: "PC = rs[7:0]"}
+  # TODO: is the branch/JAL offset relative to this instruction or to PC+1?
+
+  # --- Engine interface -------------------------------------------------------
+  PUSH:  {format: E, op: 0x7, operands: [rs], cycles: 1, desc: "TX FIFO <- rs[7:0]"}
+  POP:   {format: E, op: 0x8, operands: [rd], cycles: 1, desc: "rd = byte from RX FIFO"}
+  CFG:   {format: E, op: 0x9, operands: [sel, rs], cycles: 1, desc: "engine[sel] = rs"}
+  RDE:   {format: E, op: 0xA, operands: [rd, sel], cycles: 1, desc: "rd = engine[sel]"}
+  # TODO: what do PUSH on a full FIFO and POP on an empty FIFO do?
+
+  # --- Time -------------------------------------------------------------------
+  WAITU: {format: E, op: 0xB, operands: [rs], cycles: var, desc: "stall until TIME[15:0] == rs"}
+  WAIT:  {format: L, op: 0xC, operands: [imm9], cycles: var, unsigned: [imm9], desc: "stall imm9 cycles"}
+  # TODO: WAITU wrap semantics -- what if the target time has already passed?
+
+  # --- Misc -------------------------------------------------------------------
+  HALT:  {format: N, op: 0xD, operands: [], cycles: 1, desc: "stop; host may reload program memory"}
+
+  # op 0xE, 0xF reserved
+
+# -----------------------------------------------------------------------------
+# Pseudo-instructions: assembler conveniences, zero hardware cost
+# -----------------------------------------------------------------------------
+pseudo:
+  NOP:   {expands: "ADD r0, r0, r0"}
+  MOV:   {operands: [rd, rs],   expands: "ADD {rd}, {rs}, r0"}
+  CMP:   {operands: [rs, rt],   expands: "SUB r0, {rs}, {rt}"}
+  J:     {operands: [off9],     expands: "B AL, {off9}"}
+  CALL:  {operands: [imm9],     expands: "JAL r7, {imm9}"}
+  RET:   {expands: "JR r7"}
+
+# -----------------------------------------------------------------------------
+# Engine registers (CFG / RDE `sel` field)
+# PLACEHOLDER numbering -- reconcile with the register map in the arch doc.
+# -----------------------------------------------------------------------------
+engine_registers:
+  MODE:     {sel: 0x00, access: rw, desc: "line coding, bit order, stuffing enable"}
+  DIV:      {sel: 0x01, access: rw, desc: "tick divider"}
+  CRC_POLY: {sel: 0x02, access: rw, desc: "CRC polynomial"}
+  CRC_INIT: {sel: 0x03, access: rw, desc: "CRC initial value"}
+  STATUS:   {sel: 0x04, access: r,  desc: "FIFO and frame status"}
+  EOF:      {sel: 0x07, access: w,  desc: "write = end of frame, append CRC (trigger register)"}
+  TIME_LO:  {sel: 0x10, access: r,  desc: "TIME[15:0]"}
+  TIME_HI:  {sel: 0x11, access: r,  desc: "TIME[31:16]"}
+  LATCH_LO: {sel: 0x12, access: r,  desc: "timestamp of last SOF, low half"}
+  LATCH_HI: {sel: 0x13, access: r,  desc: "timestamp of last SOF, high half"}
